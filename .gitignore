@@ -1,0 +1,6 @@
+*.partial-*
+*.codexbundle
+*.codexbundle.age
+transfer-folder/
+chat-transfer-receipts/
+memory-import-conflicts/

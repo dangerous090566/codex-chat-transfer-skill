@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Chat Transfer"
+  short_description: "Export and safely restore selected Codex chats"
+  default_prompt: "Use $codex-chat-transfer to export selected Codex chats or safely import a transfer folder."
