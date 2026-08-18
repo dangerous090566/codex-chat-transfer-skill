@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('List', 'Export', 'Inspect', 'Import')]
+    [ValidateSet('List', 'Export', 'Inspect', 'Import', 'RestoreWorkspace', 'Verify')]
     [string]$Action,
 
     [string[]]$ThreadId = @(),
@@ -9,12 +9,15 @@ param(
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
     [switch]$IncludeArchived,
     [bool]$IncludeMemories = $true,
+    [bool]$IncludeWorkspace = $true,
     [ValidateSet('Block', 'Redact', 'Allow')]
     [string]$SecretsMode = 'Block',
     [ValidateSet('Skip', 'Merge')]
     [string]$MemoryMode = 'Skip',
     [switch]$Apply,
-    [switch]$Reconcile
+    [switch]$Reconcile,
+    [string[]]$PathMap = @(),
+    [string]$WorkspaceBackupRoot
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +26,7 @@ $ErrorActionPreference = 'Stop'
 $Schema = 'codex-chat-transfer/v1'
 $SkillRoot = Split-Path -Parent $PSScriptRoot
 $CctPath = Join-Path $SkillRoot 'assets\cct.exe'
+$WorkspaceBridgePath = Join-Path $PSScriptRoot 'codex_workspace_bridge.py'
 $ExpectedCctSha256 = '2C5C7145AD77D457BC0BC3EE7AE81A0F5729C7F4493F43517E76BAE822475A46'
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
@@ -93,9 +97,59 @@ function Invoke-Cct {
     }
     if ($ParseJson) {
         if ([string]::IsNullOrWhiteSpace($text)) { throw 'cct returned empty JSON output.' }
-        return $text | ConvertFrom-Json
+        try {
+            return $text | ConvertFrom-Json
+        } catch {
+            # cct can append a non-JSON "note:" after a successful JSON result,
+            # for example when its optional undo journal is not writable.
+            $firstBrace = $text.IndexOf('{')
+            $lastBrace = $text.LastIndexOf('}')
+            if ($firstBrace -ge 0 -and $lastBrace -gt $firstBrace) {
+                return $text.Substring($firstBrace, $lastBrace - $firstBrace + 1) | ConvertFrom-Json
+            }
+            throw
+        }
     }
     return $text
+}
+
+function Get-PythonRuntime {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PYTHON)) { $candidates += $env:CODEX_PYTHON }
+    $candidates += Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    foreach ($name in @('python3', 'python')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($null -ne $command) { $candidates += $command.Source }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return Get-FullPath $candidate
+        }
+    }
+    throw 'Python 3 is required for workspace metadata. Install Python or set CODEX_PYTHON to python.exe.'
+}
+
+function Invoke-WorkspaceBridge {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    if (-not (Test-Path -LiteralPath $WorkspaceBridgePath -PathType Leaf)) {
+        throw "Workspace bridge is missing: $WorkspaceBridgePath"
+    }
+    $python = Get-PythonRuntime
+    $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    $previousPythonUtf8 = $env:PYTHONUTF8
+    try {
+        $env:PYTHONIOENCODING = 'utf-8'
+        $env:PYTHONUTF8 = '1'
+        $output = @(& $python $WorkspaceBridgePath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $env:PYTHONIOENCODING = $previousPythonIoEncoding
+        $env:PYTHONUTF8 = $previousPythonUtf8
+    }
+    $text = ($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if ($exitCode -ne 0) { throw "Workspace bridge failed with exit code ${exitCode}: $text" }
+    if ([string]::IsNullOrWhiteSpace($text)) { throw 'Workspace bridge returned empty output.' }
+    return $text | ConvertFrom-Json
 }
 
 function Get-SessionThreadSource {
@@ -103,7 +157,7 @@ function Get-SessionThreadSource {
     if ([bool]$Session.compressed -or -not (Test-Path -LiteralPath ([string]$Session.path) -PathType Leaf)) {
         return ''
     }
-    foreach ($line in @(Get-Content -LiteralPath ([string]$Session.path) -TotalCount 12 -ErrorAction SilentlyContinue)) {
+    foreach ($line in @(Get-Content -LiteralPath ([string]$Session.path) -Encoding UTF8 -TotalCount 12 -ErrorAction SilentlyContinue)) {
         try {
             $record = $line | ConvertFrom-Json
             if ([string]$record.type -eq 'session_meta') {
@@ -134,6 +188,10 @@ function Get-SelectableSessions {
             Archived = [bool]$session.archived
             Compressed = [bool]$session.compressed
             ThreadSource = $source
+            SessionPath = [string]$session.path
+            Bytes = if (-not [bool]$session.compressed -and (Test-Path -LiteralPath ([string]$session.path) -PathType Leaf)) {
+                (Get-Item -LiteralPath ([string]$session.path)).Length
+            } else { $null }
         }
     }
     return @($sessions | Sort-Object UpdatedAt -Descending)
@@ -196,6 +254,27 @@ function Export-MemorySnapshot {
     return [pscustomobject]@{ Included = $true; Scope = 'codex-global-snapshot'; Files = $entries }
 }
 
+function Export-WorkspaceSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$StagingRoot,
+        [Parameter(Mandatory = $true)][object[]]$Sessions
+    )
+    if (-not $IncludeWorkspace) {
+        return [pscustomobject]@{ Included = $false; Schema = 'codex-chat-transfer/workspace-v1'; Path = $null; Sha256 = $null; Bytes = 0 }
+    }
+    $workspacePath = Join-Path $StagingRoot 'workspace.json'
+    $arguments = @('--action', 'snapshot', '--codex-home', (Get-FullPath $CodexHome), '--output', $workspacePath)
+    foreach ($session in $Sessions) { $arguments += @('--thread-id', [string]$session.ThreadId) }
+    Invoke-WorkspaceBridge -Arguments $arguments | Out-Null
+    return [pscustomobject]@{
+        Included = $true
+        Schema = 'codex-chat-transfer/workspace-v1'
+        Path = 'workspace.json'
+        Sha256 = Get-Sha256 $workspacePath
+        Bytes = (Get-Item -LiteralPath $workspacePath).Length
+    }
+}
+
 function Export-TransferFolder {
     if ([string]::IsNullOrWhiteSpace($TransferFolder)) { throw 'Export requires -TransferFolder.' }
     $target = Get-FullPath $TransferFolder
@@ -234,6 +313,7 @@ function Export-TransferFolder {
             }
         }
         $memory = Export-MemorySnapshot -StagingRoot $staging
+        $workspace = Export-WorkspaceSnapshot -StagingRoot $staging -Sessions $selected
         $manifest = [pscustomobject]@{
             Schema = $Schema
             ExportId = [Guid]::NewGuid().ToString()
@@ -247,6 +327,7 @@ function Export-TransferFolder {
             }
             Chats = $chatEntries
             Memories = $memory
+            Workspace = $workspace
         }
         Write-JsonFile -Path (Join-Path $staging 'manifest.json') -Value $manifest
         Move-Item -LiteralPath $staging -Destination $target
@@ -256,6 +337,7 @@ function Export-TransferFolder {
             ExportId = $manifest.ExportId
             ChatCount = $chatEntries.Count
             MemoryFileCount = @($memory.Files).Count
+            WorkspaceIncluded = [bool]$workspace.Included
             SecretsMode = $SecretsMode
             Warning = 'The transfer folder contains sensitive conversation data. Move it only through a trusted channel.'
         } | ConvertTo-Json -Depth 6
@@ -275,11 +357,46 @@ function Read-TransferManifest {
     Assert-NoReparsePoints $root
     $manifestPath = Join-Path $root 'manifest.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "manifest.json is missing: $root" }
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $manifest = Get-Content -LiteralPath $manifestPath -Encoding UTF8 -Raw | ConvertFrom-Json
     if ([string]$manifest.Schema -ne $Schema) { throw "Unsupported transfer schema: $($manifest.Schema)" }
     if ([string]$manifest.ExportId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Invalid export id.' }
     if (@($manifest.Chats).Count -eq 0) { throw 'Transfer folder contains no chats.' }
+    $workspaceProperty = $manifest.PSObject.Properties['Workspace']
+    if ($null -ne $workspaceProperty -and $null -ne $workspaceProperty.Value -and [bool]$workspaceProperty.Value.Included) {
+        if ([string]$manifest.Workspace.Schema -ne 'codex-chat-transfer/workspace-v1') {
+            throw "Unsupported workspace schema: $($manifest.Workspace.Schema)"
+        }
+        $workspaceRelative = [string]$manifest.Workspace.Path
+        if ($workspaceRelative -ne 'workspace.json') { throw "Unsafe workspace path: $workspaceRelative" }
+        $workspacePath = Resolve-SafeRelativePath -Root $root -RelativePath $workspaceRelative
+        if (-not (Test-Path -LiteralPath $workspacePath -PathType Leaf)) { throw 'workspace.json is missing.' }
+        if ((Get-Sha256 $workspacePath) -ne ([string]$manifest.Workspace.Sha256).ToUpperInvariant()) {
+            throw 'Workspace metadata hash mismatch.'
+        }
+    }
     return [pscustomobject]@{ Root = $root; Manifest = $manifest }
+}
+
+function Get-WorkspaceFile {
+    param([Parameter(Mandatory = $true)]$Transfer)
+    $workspaceProperty = $Transfer.Manifest.PSObject.Properties['Workspace']
+    if ($null -eq $workspaceProperty -or $null -eq $workspaceProperty.Value -or -not [bool]$workspaceProperty.Value.Included) {
+        return $null
+    }
+    return Resolve-SafeRelativePath -Root $Transfer.Root -RelativePath ([string]$Transfer.Manifest.Workspace.Path)
+}
+
+function Get-WorkspacePlan {
+    param([Parameter(Mandatory = $true)]$Transfer)
+    $workspacePath = Get-WorkspaceFile -Transfer $Transfer
+    if ($null -eq $workspacePath) {
+        return [pscustomobject]@{ Included = $false; Ready = $false; Reason = 'The export does not contain workspace metadata.' }
+    }
+    $arguments = @('--action', 'plan', '--codex-home', (Get-FullPath $CodexHome), '--workspace', $workspacePath)
+    foreach ($mapping in $PathMap) { $arguments += @('--path-map', $mapping) }
+    $result = Invoke-WorkspaceBridge -Arguments $arguments
+    $result | Add-Member -NotePropertyName Included -NotePropertyValue $true -Force
+    return $result
 }
 
 function Get-MemoryPlan {
@@ -341,10 +458,12 @@ function Get-ImportPlan {
         }
     }
     $memoryPlan = Get-MemoryPlan -Root $transfer.Root -Manifest $transfer.Manifest
+    $workspacePlan = Get-WorkspacePlan -Transfer $transfer
     return [pscustomobject]@{
         Transfer = $transfer
         Chats = $chatPlan
         Memories = $memoryPlan
+        Workspace = $workspacePlan
     }
 }
 
@@ -394,6 +513,8 @@ function Invoke-Import {
             Conflicts = @($plan.Memories | Where-Object Status -eq 'conflict').Count
         }
         Apply = [bool]$Apply
+        PathMap = @($PathMap)
+        Workspace = $plan.Workspace
     }
     if (-not $Apply) {
         $summary | ConvertTo-Json -Depth 20
@@ -423,6 +544,7 @@ function Invoke-Import {
         }
         $arguments = @('import', $chat.Bundle, '--codex-home', (Get-FullPath $CodexHome), '--json')
         if ($Reconcile) { $arguments += '--reconcile' }
+        foreach ($mapping in $PathMap) { $arguments += @('--map-cwd', $mapping) }
         $result = Invoke-Cct -Arguments $arguments -ParseJson
         $imported += [pscustomobject]@{ ThreadId = $chat.ThreadId; Title = $chat.Title; Result = $result }
     }
@@ -441,6 +563,14 @@ function Invoke-Import {
         TransferFolder = $plan.Transfer.Root
         Chats = $imported
         Memories = $memoryResult
+        PathMap = @($PathMap)
+        Workspace = [pscustomobject]@{
+            Included = [bool]$plan.Workspace.Included
+            RestoreRequired = [bool]$plan.Workspace.Included
+            Instruction = if ([bool]$plan.Workspace.Included) {
+                'After Codex indexes the imported sessions, close Codex and run RestoreWorkspace -Apply with the same PathMap values.'
+            } else { $null }
+        }
         UndoNote = 'Use cct undo for each changed chat import; remove only memory files listed in Memories.Added after reviewing later edits.'
     }
     Write-JsonFile -Path $receiptPath -Value $receipt
@@ -453,7 +583,59 @@ function Invoke-Import {
         MemoryConflictRoot = $memoryResult.ConflictRoot
         Receipt = $receiptPath
         RestartRecommended = -not [bool]$Reconcile
+        WorkspaceRestoreRequired = [bool]$plan.Workspace.Included
     } | ConvertTo-Json -Depth 10
+}
+
+function Invoke-RestoreWorkspace {
+    $transfer = Read-TransferManifest
+    $workspacePath = Get-WorkspaceFile -Transfer $transfer
+    if ($null -eq $workspacePath) { throw 'This transfer package does not contain workspace metadata.' }
+    $bridgeAction = if ($Apply) { 'restore' } else { 'plan' }
+    $defaultCodexHome = Get-FullPath (Join-Path $env:USERPROFILE '.codex')
+    $targetsLiveCodexHome = (Get-FullPath $CodexHome).Equals($defaultCodexHome, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($Apply -and $targetsLiveCodexHome -and (Test-CodexRunning)) {
+        throw 'Close Codex before applying workspace restoration. Run without -Apply first to preview the plan.'
+    }
+    $arguments = @('--action', $bridgeAction, '--codex-home', (Get-FullPath $CodexHome), '--workspace', $workspacePath)
+    foreach ($mapping in $PathMap) { $arguments += @('--path-map', $mapping) }
+    if ($Apply -and -not [string]::IsNullOrWhiteSpace($WorkspaceBackupRoot)) {
+        $arguments += @('--backup-root', (Get-FullPath $WorkspaceBackupRoot))
+    }
+    Invoke-WorkspaceBridge -Arguments $arguments | ConvertTo-Json -Depth 20
+}
+
+function Invoke-VerifyTransfer {
+    $plan = Get-ImportPlan
+    $workspacePath = Get-WorkspaceFile -Transfer $plan.Transfer
+    $workspaceVerification = if ($null -eq $workspacePath) {
+        [pscustomobject]@{ Status = 'not-included'; Verified = $null }
+    } else {
+        $arguments = @('--action', 'verify', '--codex-home', (Get-FullPath $CodexHome), '--workspace', $workspacePath)
+        foreach ($mapping in $PathMap) { $arguments += @('--path-map', $mapping) }
+        Invoke-WorkspaceBridge -Arguments $arguments
+    }
+    $chatVerification = @($plan.Chats | ForEach-Object {
+        [pscustomobject]@{
+            ThreadId = $_.ThreadId
+            Title = $_.Title
+            Identical = ([int]$_.Diff.identical -eq 1)
+            Diff = $_.Diff
+        }
+    })
+    $memoryVerification = @($plan.Memories | ForEach-Object {
+        [pscustomobject]@{ Path = $_.Path; Status = $_.Status; Sha256 = $_.Sha256 }
+    })
+    [pscustomobject]@{
+        Status = 'verification-complete'
+        ExportId = $plan.Transfer.Manifest.ExportId
+        Chats = $chatVerification
+        Workspace = $workspaceVerification
+        Memories = $memoryVerification
+        Verified = (@($chatVerification | Where-Object { -not $_.Identical }).Count -eq 0) -and
+            ($null -eq $workspaceVerification.Verified -or [bool]$workspaceVerification.Verified) -and
+            (@($memoryVerification | Where-Object Status -eq 'conflict').Count -eq 0)
+    } | ConvertTo-Json -Depth 20
 }
 
 switch ($Action) {
@@ -466,4 +648,6 @@ switch ($Action) {
         Invoke-Import
     }
     'Import' { Invoke-Import }
+    'RestoreWorkspace' { Invoke-RestoreWorkspace }
+    'Verify' { Invoke-VerifyTransfer }
 }

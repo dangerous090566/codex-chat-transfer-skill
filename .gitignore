@@ -4,3 +4,5 @@
 transfer-folder/
 chat-transfer-receipts/
 memory-import-conflicts/
+__pycache__/
+*.pyc
