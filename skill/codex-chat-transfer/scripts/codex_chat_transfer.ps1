@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('List', 'Export', 'Inspect', 'Import', 'RestoreWorkspace', 'Verify')]
+    [ValidateSet('List', 'Packages', 'Export', 'Inspect', 'Import', 'RestoreWorkspace', 'Verify')]
     [string]$Action,
 
     [string[]]$ThreadId = @(),
     [string]$TransferFolder,
+    [string]$TransferRoot,
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
     [switch]$IncludeArchived,
     [bool]$IncludeMemories = $true,
@@ -27,12 +28,19 @@ $Schema = 'codex-chat-transfer/v1'
 $SkillRoot = Split-Path -Parent $PSScriptRoot
 $CctPath = Join-Path $SkillRoot 'assets\cct.exe'
 $WorkspaceBridgePath = Join-Path $PSScriptRoot 'codex_workspace_bridge.py'
-$ExpectedCctSha256 = '2C5C7145AD77D457BC0BC3EE7AE81A0F5729C7F4493F43517E76BAE822475A46'
+$ExpectedCctSha256 = '94ECEC6D2A82184319500795BB600C3D57D212814E512C64480078CC2403BD20'
+$MaxSessionBytes = 512MB
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Get-FullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Get-IsoTimestamp {
+    param($Value)
+    if ($Value -is [DateTime] -or $Value -is [DateTimeOffset]) { return $Value.ToUniversalTime().ToString('o') }
+    return [string]$Value
 }
 
 function Assert-PathUnder {
@@ -161,7 +169,12 @@ function Get-SessionThreadSource {
         try {
             $record = $line | ConvertFrom-Json
             if ([string]$record.type -eq 'session_meta') {
-                return [string]$record.payload.thread_source
+                if ($record.payload.PSObject.Properties['thread_source']) {
+                    return [string]$record.payload.thread_source
+                }
+                if ($record.payload.PSObject.Properties['source'] -and $record.payload.source -isnot [string] -and
+                    $record.payload.source.PSObject.Properties['subagent']) { return 'subagent' }
+                return ''
             }
         } catch {
             continue
@@ -174,15 +187,27 @@ function Get-SelectableSessions {
     $arguments = @('list', '--tool', 'codex', '--codex-home', (Get-FullPath $CodexHome), '--json')
     if ($IncludeArchived) { $arguments += '--include-archived' }
     $result = Invoke-Cct -Arguments $arguments -ParseJson
+    $metadataArguments = @('--action', 'metadata', '--codex-home', (Get-FullPath $CodexHome))
+    foreach ($session in @($result.sessions)) { $metadataArguments += @('--thread-id', [string]$session.thread_id) }
+    $metadataResult = Invoke-WorkspaceBridge -Arguments $metadataArguments
+    $metadataById = @{}
+    foreach ($item in @($metadataResult.Threads)) { $metadataById[[string]$item.ThreadId] = $item }
     $sessions = @()
     foreach ($session in @($result.sessions)) {
         $source = Get-SessionThreadSource $session
+        $metadata = $metadataById[[string]$session.thread_id]
+        if ($null -ne $metadata -and -not [string]::IsNullOrWhiteSpace([string]$metadata.ThreadSource)) {
+            $source = [string]$metadata.ThreadSource
+        }
         if (-not [string]::IsNullOrWhiteSpace($source) -and $source -ne 'user') { continue }
+        if (-not $IncludeArchived -and $null -ne $metadata -and [bool]$metadata.Archived) { continue }
         $sessions += [pscustomobject]@{
             ThreadId = [string]$session.thread_id
-            Title = [string]$session.preview
-            UpdatedAt = [string]$session.updated_at
-            Cwd = [string]$session.cwd
+            Title = if ($null -ne $metadata -and $metadata.Title) { [string]$metadata.Title }
+                elseif ($session.PSObject.Properties['preview']) { [string]$session.preview }
+                else { [string]$session.thread_id }
+            UpdatedAt = if ($null -ne $metadata -and $metadata.UpdatedAt) { Get-IsoTimestamp $metadata.UpdatedAt } else { Get-IsoTimestamp $session.updated_at }
+            Cwd = if ($null -ne $metadata -and $metadata.Cwd) { [string]$metadata.Cwd } else { [string]$session.cwd }
             Source = [string]$session.source
             ModelProvider = [string]$session.model_provider
             Archived = [bool]$session.archived
@@ -194,7 +219,8 @@ function Get-SelectableSessions {
             } else { $null }
         }
     }
-    return @($sessions | Sort-Object UpdatedAt -Descending)
+    return @($sessions | Sort-Object UpdatedAt -Descending | Group-Object ThreadId |
+        ForEach-Object { $_.Group[0] } | Sort-Object UpdatedAt -Descending)
 }
 
 function Resolve-SelectedSessions {
@@ -219,15 +245,7 @@ function Resolve-SelectedSessions {
 
 function Assert-NoReparsePoints {
     param([Parameter(Mandatory = $true)][string]$Root)
-    $rootItem = Get-Item -LiteralPath $Root -Force
-    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Linked or reparse-point folder is not allowed: $Root"
-    }
-    foreach ($item in @(Get-ChildItem -LiteralPath $Root -Recurse -Force)) {
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Linked or reparse-point item is not allowed: $($item.FullName)"
-        }
-    }
+    Invoke-WorkspaceBridge -Arguments @('--action', 'validate-tree', '--codex-home', (Get-FullPath $CodexHome), '--root', (Get-FullPath $Root)) | Out-Null
 }
 
 function Export-MemorySnapshot {
@@ -288,6 +306,11 @@ function Export-TransferFolder {
     try {
         $sessions = Get-SelectableSessions
         $selected = Resolve-SelectedSessions -Sessions $sessions
+        foreach ($session in $selected) {
+            if ($null -ne $session.Bytes -and $session.Bytes -gt $MaxSessionBytes) {
+                throw "Session $($session.ThreadId) exceeds the 512 MiB supported limit; keep the history intact and use a reviewed larger runtime."
+            }
+        }
         $chatRoot = Join-Path $staging 'chats'
         [System.IO.Directory]::CreateDirectory($chatRoot) | Out-Null
         $chatEntries = @()
@@ -302,6 +325,11 @@ function Export-TransferFolder {
             }
             Invoke-Cct -Arguments $arguments | Out-Null
             Invoke-Cct -Arguments @('inspect', $bundlePath, '--json') -ParseJson | Out-Null
+            $exportDiff = Invoke-Cct -Arguments @('diff', $bundlePath, '--codex-home', (Get-FullPath $CodexHome), '--json') -ParseJson
+            if ([int]$exportDiff.sessions_in_bundle -ne 1 -or
+                ($SecretsMode -ne 'Redact' -and [int]$exportDiff.identical -ne 1)) {
+                throw 'Export verification failed or the source changed during export; retry after the chat is idle.'
+            }
             $chatEntries += [pscustomobject]@{
                 ThreadId = $session.ThreadId
                 Title = $session.Title
@@ -319,7 +347,7 @@ function Export-TransferFolder {
             ExportId = [Guid]::NewGuid().ToString()
             CreatedUtc = [DateTime]::UtcNow.ToString('o')
             Source = [pscustomobject]@{ Platform = 'windows'; CodexHomeName = (Split-Path -Leaf (Get-FullPath $CodexHome)) }
-            Tool = [pscustomobject]@{ Name = 'cct'; Version = '2.0.0'; Sha256 = $ExpectedCctSha256 }
+            Tool = [pscustomobject]@{ Name = 'cct'; Version = '2.0.0+large512.1'; Sha256 = $ExpectedCctSha256 }
             Exactness = [pscustomobject]@{
                 HistoricalSessionRecords = if ($SecretsMode -eq 'Redact') { 'redacted' } else { 'preserved' }
                 FutureResponses = 'not-guaranteed'
@@ -344,7 +372,7 @@ function Export-TransferFolder {
     } catch {
         if (Test-Path -LiteralPath $staging) {
             Assert-PathUnder -Parent $parent -Child $staging | Out-Null
-            Remove-Item -LiteralPath $staging -Recurse -Force
+            Write-Warning "Export did not complete. Partial files were retained for review: $staging"
         }
         throw
     }
@@ -447,7 +475,9 @@ function Get-ImportPlan {
         if ($bundleSessions.Count -ne 1 -or -not ([string]$bundleSessions[0].thread_id).Equals($threadId, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Bundle identity does not match the outer manifest: $relative"
         }
-        $diff = Invoke-Cct -Arguments @('diff', $bundle, '--codex-home', (Get-FullPath $CodexHome), '--json') -ParseJson
+        $diffArguments = @('diff', $bundle, '--codex-home', (Get-FullPath $CodexHome), '--json')
+        foreach ($mapping in $PathMap) { $diffArguments += @('--map-cwd', $mapping) }
+        $diff = Invoke-Cct -Arguments $diffArguments -ParseJson
         $chatPlan += [pscustomobject]@{
             ThreadId = $threadId
             Title = [string]$chat.Title
@@ -519,6 +549,9 @@ function Invoke-Import {
     if (-not $Apply) {
         $summary | ConvertTo-Json -Depth 20
         return
+    }
+    if ([bool]$plan.Workspace.Included -and -not [bool]$plan.Workspace.Ready) {
+        throw 'Mapped workspace directories are missing. Review Inspect and provide valid PathMap destinations before importing.'
     }
     $defaultCodexHome = Get-FullPath (Join-Path $env:USERPROFILE '.codex')
     $targetsLiveCodexHome = (Get-FullPath $CodexHome).Equals($defaultCodexHome, [System.StringComparison]::OrdinalIgnoreCase)
@@ -624,24 +657,46 @@ function Invoke-VerifyTransfer {
         }
     })
     $memoryVerification = @($plan.Memories | ForEach-Object {
-        [pscustomobject]@{ Path = $_.Path; Status = $_.Status; Sha256 = $_.Sha256 }
+        $status = if ($MemoryMode -eq 'Skip') { 'skipped' } else { $_.Status }
+        if ($MemoryMode -eq 'Merge' -and $status -eq 'conflict') {
+            $quarantineRoot = Join-Path (Get-FullPath $CodexHome) ('memory-import-conflicts/' + $plan.Transfer.Manifest.ExportId)
+            $quarantined = Resolve-SafeRelativePath -Root $quarantineRoot -RelativePath $_.Path.Substring('memories/'.Length)
+            if ((Test-Path -LiteralPath $quarantined -PathType Leaf) -and (Get-Sha256 $quarantined) -eq $_.Sha256) {
+                $status = 'quarantined'
+            }
+        }
+        [pscustomobject]@{ Path = $_.Path; Status = $status; Sha256 = $_.Sha256 }
     })
     [pscustomobject]@{
         Status = 'verification-complete'
         ExportId = $plan.Transfer.Manifest.ExportId
         Chats = $chatVerification
         Workspace = $workspaceVerification
+        MemoryMode = $MemoryMode
         Memories = $memoryVerification
         Verified = (@($chatVerification | Where-Object { -not $_.Identical }).Count -eq 0) -and
             ($null -eq $workspaceVerification.Verified -or [bool]$workspaceVerification.Verified) -and
-            (@($memoryVerification | Where-Object Status -eq 'conflict').Count -eq 0)
+            (@($memoryVerification | Where-Object { $_.Status -notin @('identical', 'quarantined', 'skipped') }).Count -eq 0)
     } | ConvertTo-Json -Depth 20
+}
+
+. (Join-Path $PSScriptRoot 'transfer_storage.ps1')
+$ResolvedTransferRoot = Get-ConfiguredTransferRoot
+if ($Action -notin @('List', 'Packages')) {
+    $TransferFolder = Resolve-TransferFolderArgument
+    if ([string]::IsNullOrWhiteSpace($TransferFolder)) {
+        $storageSummary = Get-TransferStorageSummary
+        $storageSummary | Add-Member -NotePropertyName Status -NotePropertyValue 'selection-required'
+        $storageSummary | ConvertTo-Json -Depth 8
+        return
+    }
 }
 
 switch ($Action) {
     'List' {
-        [pscustomobject]@{ CodexHome = Get-FullPath $CodexHome; Chats = @(Get-SelectableSessions) } | ConvertTo-Json -Depth 8
+        [pscustomobject]@{ CodexHome = Get-FullPath $CodexHome; TransferRoot = $ResolvedTransferRoot; Chats = @(Get-SelectableSessions) } | ConvertTo-Json -Depth 8
     }
+    'Packages' { Get-TransferStorageSummary | ConvertTo-Json -Depth 8 }
     'Export' { Export-TransferFolder }
     'Inspect' {
         $Apply = $false

@@ -38,6 +38,9 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 - `RestoreWorkspace -Apply` refuses to run while Codex is open.
 - It requires `id`, `title`, and `cwd` columns in the current `threads` table. Schema drift stops the operation instead of guessing.
 - It reuses a destination local project only when its normalized root set exactly matches the mapped roots; otherwise it creates a new local project ID.
+- On current schemas it updates `threads.name` and `threads.project_id`, and creates/reuses rows in `projects` and `project_roots`. Older schemas use `threads.title` and global project assignments. Display names are also appended to `session_index.jsonl`, whose existing contents are backed up.
+- Source snapshots prefer an explicit native or legacy project assignment. If neither exists, a unique exact cwd match against saved project roots may preserve implicit grouping; snapshots record this basis. They do not infer membership for an explicitly projectless chat.
+- Native `lstat` reparse tags are used for package files: normal/cloud files are supported, while symlinks, junctions, and unknown reparse types are refused. Project destinations may themselves be cloud-backed.
 - Before mutation it creates SQLite and global-state backups under `<CODEX_HOME>/chat-transfer-backups/<timestamp>/`.
 - The detached helper writes `<export-id>-workspace-restore.json` under `<CODEX_HOME>/chat-transfer-receipts/`.
 - If an imported task is not indexed, restart Codex and retry. Do not insert a guessed row.

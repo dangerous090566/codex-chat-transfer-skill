@@ -22,6 +22,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from workspace_index import load_context, display_title, selected_project, metadata, native_projects, table_columns, validate_tree
+from contextlib import closing
+
 
 WORKSPACE_SCHEMA = "codex-chat-transfer/workspace-v1"
 
@@ -122,61 +125,25 @@ def require_thread_columns(connection: sqlite3.Connection) -> None:
 def snapshot(codex_home: Path, thread_ids: list[str], output: Path) -> dict[str, Any]:
     if not thread_ids:
         raise RuntimeError("Snapshot requires at least one thread id")
-    db_path = database_path(codex_home)
-    state = read_json(global_state_path(codex_home))
-    connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30)
-    connection.row_factory = sqlite3.Row
-    try:
-        require_thread_columns(connection)
-        placeholders = ",".join("?" for _ in thread_ids)
-        rows = {
-            row["id"]: dict(row)
-            for row in connection.execute(
-                f"SELECT id, title, cwd FROM threads WHERE id IN ({placeholders})", thread_ids
-            )
-        }
-    finally:
-        connection.close()
-    missing = [thread_id for thread_id in thread_ids if thread_id not in rows]
+    context = load_context(codex_home, thread_ids)
+    missing = [thread_id for thread_id in thread_ids if thread_id not in context["rows"]]
     if missing:
         raise RuntimeError("Selected threads are missing from the Codex index: " + ", ".join(missing))
-
-    assignments = state.get("thread-project-assignments") or {}
-    local_projects = state.get("local-projects") or {}
-    if not isinstance(assignments, dict) or not isinstance(local_projects, dict):
-        raise RuntimeError("Unsupported Codex global project state")
-
-    selected_projects: dict[str, dict[str, Any]] = {}
-    threads: list[dict[str, Any]] = []
-    for thread_id in thread_ids:
-        row = rows[thread_id]
-        assignment = assignments.get(thread_id)
-        project_ref = None
-        if isinstance(assignment, dict) and assignment.get("projectKind") == "local":
-            source_project_id = str(assignment.get("projectId") or "")
-            project = local_projects.get(source_project_id)
-            if source_project_id and isinstance(project, dict):
-                project_ref = source_project_id
-                selected_projects[source_project_id] = {
-                    "SourceProjectId": source_project_id,
-                    "Name": str(project.get("name") or ""),
-                    "RootPaths": [strip_extended_prefix(str(item)) for item in project.get("rootPaths") or []],
-                }
-        threads.append(
-            {
-                "ThreadId": thread_id,
-                "Title": str(row["title"]),
-                "Cwd": strip_extended_prefix(str(row["cwd"])),
-                "SourceProjectId": project_ref,
+    projects, threads = {}, []
+    for thread_id in dict.fromkeys(thread_ids):
+        row = context["rows"][thread_id]
+        project_id, project, basis = selected_project(context, thread_id)
+        if project is not None:
+            projects[project_id] = {
+                "SourceProjectId": project_id, "Name": str(project.get("name") or ""),
+                "RootPaths": [strip_extended_prefix(str(root)) for root in project.get("rootPaths", [])],
             }
-        )
-
-    result = {
-        "Schema": WORKSPACE_SCHEMA,
-        "CapturedUtc": utc_now(),
-        "Threads": threads,
-        "Projects": list(selected_projects.values()),
-    }
+        threads.append({
+            "ThreadId": thread_id, "Title": display_title(context, thread_id),
+            "Cwd": strip_extended_prefix(str(row["cwd"])), "SourceProjectId": project_id,
+            "ProjectAssociationBasis": basis,
+        })
+    result = {"Schema": WORKSPACE_SCHEMA, "CapturedUtc": utc_now(), "Threads": threads, "Projects": list(projects.values())}
     write_json_atomic(output, result)
     return result
 
@@ -208,6 +175,9 @@ def build_plan(workspace: dict[str, Any], path_maps: list[str]) -> dict[str, Any
         }
         for thread in workspace.get("Threads") or []
     ]
+    for thread in threads:
+        if not os.path.isdir(thread["Cwd"]):
+            missing_roots.append(thread["Cwd"])
     return {
         "Schema": WORKSPACE_SCHEMA,
         "Projects": projects,
@@ -219,7 +189,7 @@ def build_plan(workspace: dict[str, Any], path_maps: list[str]) -> dict[str, Any
 
 def create_backups(codex_home: Path, db_path: Path, state_path: Path, backup_root: Path | None) -> tuple[Path, Path]:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    root = backup_root or (codex_home / "chat-transfer-backups" / stamp)
+    root = backup_root or (codex_home / "chat-transfer-backups" / (stamp + "-" + uuid.uuid4().hex[:8]))
     root.mkdir(parents=True, exist_ok=False)
     db_backup = root / db_path.name
     state_backup = root / state_path.name
@@ -231,6 +201,9 @@ def create_backups(codex_home: Path, db_path: Path, state_path: Path, backup_roo
         destination.close()
         source.close()
     shutil.copy2(state_path, state_backup)
+    index_path = codex_home / "session_index.jsonl"
+    if index_path.exists():
+        shutil.copy2(index_path, root / "session_index.jsonl")
     return db_backup, state_backup
 
 
@@ -325,11 +298,37 @@ def restore(codex_home: Path, workspace: dict[str, Any], path_maps: list[str], b
     try:
         require_thread_columns(connection)
         connection.execute("BEGIN IMMEDIATE")
+        columns = table_columns(connection, "threads")
+        native = native_projects(connection)
+        native_map = {}
+        if native is not None:
+            if "project_id" not in columns:
+                raise RuntimeError("Native projects exist but threads.project_id is missing")
+            for project in plan["Projects"]:
+                project_id = find_project_by_roots(native, project["RootPaths"])
+                if project_id is None:
+                    project_id = str(uuid.uuid4())
+                    position = connection.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM projects").fetchone()[0]
+                    connection.execute(
+                        "INSERT INTO projects(id,name,metadata,position,created_at_ms,updated_at_ms) VALUES(?,?,?, ?,?,?)",
+                        (project_id, project["Name"], "{}", position, now_ms, now_ms),
+                    )
+                    for position, root in enumerate(project["RootPaths"]):
+                        connection.execute("INSERT INTO project_roots(project_id,position,path) VALUES(?,?,?)", (project_id, position, root))
+                    native[project_id] = {"name": project["Name"], "rootPaths": project["RootPaths"]}
+                else:
+                    connection.execute("UPDATE projects SET name=?,updated_at_ms=? WHERE id=?", (project["Name"], now_ms, project_id))
+                native_map[project["SourceProjectId"]] = project_id
         for thread in plan["Threads"]:
-            cursor = connection.execute(
-                "UPDATE threads SET cwd = ?, title = ? WHERE id = ?",
-                ("\\\\?\\" + thread["Cwd"], thread["Title"], thread["ThreadId"]),
-            )
+            name_column = "name" if "name" in columns else "title"
+            values = ["\\\\?\\" + thread["Cwd"], thread["Title"]]
+            updates = ["cwd = ?", name_column + " = ?"]
+            source_project = thread.get("SourceProjectId")
+            if source_project in native_map:
+                updates.append("project_id = ?")
+                values.append(native_map[source_project])
+            values.append(thread["ThreadId"])
+            cursor = connection.execute("UPDATE threads SET " + ", ".join(updates) + " WHERE id = ?", values)
             if cursor.rowcount != 1:
                 raise RuntimeError(f"Expected one index row for {thread['ThreadId']}, got {cursor.rowcount}")
         os.replace(temp_state, state_path)
@@ -339,20 +338,29 @@ def restore(codex_home: Path, workspace: dict[str, Any], path_maps: list[str], b
         connection.rollback()
         if state_replaced:
             shutil.copy2(state_backup, state_path)
-        else:
-            try:
-                temp_state.unlink()
-            except FileNotFoundError:
-                pass
+        # Keep an uncommitted temporary state file available for diagnosis.
         raise
     finally:
         connection.close()
 
-    verification = verify(codex_home, workspace, path_maps)
-    if not verification["Verified"]:
-        shutil.copy2(db_backup, db_path)
+    index_path = codex_home / "session_index.jsonl"
+    previous_index = index_path.read_bytes() if index_path.exists() else b""
+    try:
+        with index_path.open("ab") as handle:
+            if previous_index and not previous_index.endswith(b"\n"):
+                handle.write(b"\n")
+            for thread in plan["Threads"]:
+                handle.write((json.dumps({"id": thread["ThreadId"], "thread_name": thread["Title"], "updated_at": utc_now()}, ensure_ascii=False) + "\n").encode("utf-8"))
+        verification = verify(codex_home, workspace, path_maps)
+        if not verification["Verified"]:
+            raise RuntimeError("Workspace post-restore verification failed")
+    except Exception:
+        # SQLite's backup API restores coherently even if a WAL exists.
+        with closing(sqlite3.connect(db_backup)) as backup_connection, closing(sqlite3.connect(db_path)) as destination_connection:
+            backup_connection.backup(destination_connection)
         shutil.copy2(state_backup, state_path)
-        raise RuntimeError("Workspace post-restore verification failed")
+        index_path.write_bytes(previous_index)
+        raise
     return {
         "Status": "workspace-restored",
         "BackupDatabase": str(db_backup),
@@ -365,93 +373,57 @@ def restore(codex_home: Path, workspace: dict[str, Any], path_maps: list[str], b
 
 def verify(codex_home: Path, workspace: dict[str, Any], path_maps: list[str]) -> dict[str, Any]:
     plan = build_plan(workspace, path_maps)
-    db_path = database_path(codex_home)
-    state = read_json(global_state_path(codex_home))
-    local_projects = state.get("local-projects") or {}
-    assignments = state.get("thread-project-assignments") or {}
-    connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30)
-    connection.row_factory = sqlite3.Row
-    try:
-        require_thread_columns(connection)
-        ids = [thread["ThreadId"] for thread in plan["Threads"]]
-        placeholders = ",".join("?" for _ in ids)
-        rows = {
-            row["id"]: dict(row)
-            for row in connection.execute(
-                f"SELECT id, title, cwd FROM threads WHERE id IN ({placeholders})", ids
-            )
-        }
-    finally:
-        connection.close()
-
-    project_results: list[dict[str, Any]] = []
-    source_to_local: dict[str, str] = {}
+    context = load_context(codex_home, [thread["ThreadId"] for thread in plan["Threads"]])
+    projects = {}
+    projects.update(context["state"].get("local-projects") or {})
+    projects.update(context["projects"] or {})
+    project_results = []
+    expected_roots = {}
     for project in plan["Projects"]:
-        project_id = find_project_by_roots(local_projects, project["RootPaths"])
-        found = project_id is not None
-        if found:
-            source_to_local[project["SourceProjectId"]] = str(project_id)
-        project_results.append(
-            {
-                "Name": project["Name"],
-                "RootPaths": project["RootPaths"],
-                "ProjectId": project_id,
-                "Verified": found,
-            }
-        )
-
-    thread_results: list[dict[str, Any]] = []
+        project_id = find_project_by_roots(projects, project["RootPaths"])
+        expected_roots[project["SourceProjectId"]] = {comparable_path(root) for root in project["RootPaths"]}
+        project_results.append({"Name": project["Name"], "RootPaths": project["RootPaths"], "ProjectId": project_id, "Verified": project_id is not None})
+    results = []
     for thread in plan["Threads"]:
-        row = rows.get(thread["ThreadId"])
-        title_ok = row is not None and str(row["title"]) == thread["Title"]
-        cwd_ok = row is not None and comparable_path(str(row["cwd"])) == comparable_path(thread["Cwd"])
+        row = context["rows"].get(thread["ThreadId"])
+        title_ok = row is not None and display_title(context, thread["ThreadId"]) == thread["Title"]
+        cwd_ok = row is not None and comparable_path(row["cwd"]) == comparable_path(thread["Cwd"])
         project_ok = True
-        source_project_id = thread.get("SourceProjectId")
-        if source_project_id:
-            expected_project_id = source_to_local.get(source_project_id)
-            assignment = assignments.get(thread["ThreadId"])
-            project_ok = (
-                expected_project_id is not None
-                and isinstance(assignment, dict)
-                and assignment.get("projectKind") == "local"
-                and assignment.get("projectId") == expected_project_id
-            )
-        thread_results.append(
-            {
-                "ThreadId": thread["ThreadId"],
-                "Title": thread["Title"],
-                "Cwd": thread["Cwd"],
-                "TitleVerified": title_ok,
-                "CwdVerified": cwd_ok,
-                "ProjectVerified": project_ok,
-                "Verified": title_ok and cwd_ok and project_ok,
-            }
-        )
-
-    verified = plan["Ready"] and all(item["Verified"] for item in project_results + thread_results)
-    return {
-        "Status": "workspace-verification",
-        "Ready": plan["Ready"],
-        "MissingProjectRoots": plan["MissingProjectRoots"],
-        "Projects": project_results,
-        "Threads": thread_results,
-        "Verified": verified,
-    }
+        source_project = thread.get("SourceProjectId")
+        if source_project:
+            _, actual_project, _ = selected_project(context, thread["ThreadId"])
+            actual_roots = {comparable_path(root) for root in actual_project.get("rootPaths", [])} if actual_project else set()
+            project_ok = actual_project is not None and actual_roots == expected_roots.get(source_project)
+        results.append({
+            "ThreadId": thread["ThreadId"], "Title": thread["Title"], "Cwd": thread["Cwd"],
+            "TitleVerified": title_ok, "CwdVerified": cwd_ok, "ProjectVerified": project_ok,
+            "Verified": title_ok and cwd_ok and project_ok,
+        })
+    return {"Status": "workspace-verification", "Ready": plan["Ready"], "MissingProjectRoots": plan["MissingProjectRoots"],
+            "Projects": project_results, "Threads": results,
+            "Verified": plan["Ready"] and all(item["Verified"] for item in project_results + results)}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("snapshot", "plan", "restore", "verify"), required=True)
+    parser.add_argument("--action", choices=("validate-tree", "metadata", "snapshot", "plan", "restore", "verify"), required=True)
     parser.add_argument("--codex-home", required=True)
     parser.add_argument("--workspace")
     parser.add_argument("--output")
+    parser.add_argument("--root")
     parser.add_argument("--thread-id", action="append", default=[])
     parser.add_argument("--path-map", action="append", default=[])
     parser.add_argument("--backup-root")
     args = parser.parse_args()
 
     codex_home = Path(args.codex_home).resolve()
-    if args.action == "snapshot":
+    if args.action == "validate-tree":
+        if not args.root:
+            raise RuntimeError("validate-tree requires --root")
+        result = validate_tree(Path(os.path.abspath(args.root)))
+    elif args.action == "metadata":
+        result = metadata(codex_home, args.thread_id)
+    elif args.action == "snapshot":
         if not args.output:
             raise RuntimeError("Snapshot requires --output")
         result = snapshot(codex_home, args.thread_id, Path(args.output).resolve())

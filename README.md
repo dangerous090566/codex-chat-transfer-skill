@@ -32,6 +32,16 @@ Copy-Item -LiteralPath ".\codex-chat-transfer-skill\skill\codex-chat-transfer" -
 
 ## 使用
 
+导出与导入默认共用：
+
+```text
+%USERPROFILE%\Nutstore\1\我的坚果云\codex文件处理\Codex聊天迁移
+```
+
+导出自动创建独立子文件夹；导入先查找这个目录中的迁移包。只有一个已解压包时可以自动选中，有多个时会列出供选择。ZIP 需先完整解压。
+
+可用 `-TransferRoot` 或环境变量 `CODEX_CHAT_TRANSFER_ROOT` 覆盖，也可在本机 `.codex/chat-transfer-settings.json` 中保存 `{"TransferRoot":"绝对路径"}`。机器路径和私有聊天不上传到本仓库。
+
 导出：
 
 > 使用 `$codex-chat-transfer` 列出我的聊天，让我选择若干个后导出。
@@ -51,6 +61,16 @@ skill 可以保留已导出的历史会话记录，并恢复所选任务的显�
 ## v1.1 更新
 
 本版来自一次四任务跨设备迁移的实际故障复盘，补充了 UTF-8 清单读取、大文件保真要求、路径映射、选定项目元数据快照、显示标题恢复、关闭 Codex 后的备份式索引修复、项目创建/归属恢复以及最终端到端验证。`cct --reconcile` 仍被视为尽力而为，不再作为“恢复成功”的唯一依据。
+
+## v1.2 更新
+
+- 默认共用迁移目录，支持自动新建导出包、包列表和多包选择。
+- 修复 `preview` 缺失导致列表/导出失败，恢复正确显示标题，去重并过滤子代理。
+- 内置基于 cct v2.0.0 的 `large512.1` 构建：单会话上限 512 MiB，总解压上限仍为 2 GiB。原始 398 MiB 会话已实际验证，不删图片、不裁剪聊天。
+- 支持新版 `threads.name`、原生项目表以及旧版项目配置；恢复过程保持备份、关闭应用和验证要求。
+- 修复坚果云文件夹被 PowerShell 误判为重解析点、路径映射未传递给差异检查、记忆 Skip/隔离冲突验证等问题。
+
+验证：`python -m unittest discover -s tests -v`。Windows 集成测试需要 PowerShell 7，可用 `CCT_TEST_PWSH` 指定其路径；测试只使用隔离目录。构建来源、补丁和哈希见 skill 的 `references/third-party-notices.md`。
 
 ## 第三方组件
 
