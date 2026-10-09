@@ -8,6 +8,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 $mainScript = Join-Path $PSScriptRoot 'codex_chat_transfer.ps1'
 $manifestPath = Join-Path ([IO.Path]::GetFullPath($TransferFolder)) 'manifest.json'

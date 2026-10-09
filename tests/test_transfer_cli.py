@@ -19,8 +19,8 @@ class TransferCliTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="transfer-cli-test-", dir=os.environ.get("CCT_TEST_ROOT")))
         self.home = self.root / "codex"
-        self.storage = self.root / "storage"
-        self.project = self.root / "project"
+        self.storage = self.root / "迁移包"
+        self.project = self.root / "论文项目"
         self.project.mkdir()
         self.thread = "22222222-2222-4222-8222-222222222222"
         session_dir = self.home / "sessions/2026/10/08"
@@ -109,6 +109,26 @@ class TransferCliTests(unittest.TestCase):
         verified = self.call("Verify", "-MemoryMode", "Merge")
         self.assertTrue(verified["Verified"])
         self.assertEqual(verified["Memories"][0]["Status"], "quarantined")
+
+    def test_nested_powershell_parses_unicode_verification_with_legacy_codepage(self):
+        exported = self.call("Export", "-ThreadId", self.thread)
+        environment = os.environ.copy()
+        environment.update(CCT_SCRIPT=str(SCRIPT), CCT_HOME=str(self.home),
+                           CCT_PACKAGE=exported["TransferFolder"])
+        environment.pop("CODEX_CHAT_TRANSFER_ROOT", None)
+        command = (
+            "[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(936); "
+            "$json = & $env:CCT_SCRIPT -Action Verify -CodexHome $env:CCT_HOME "
+            "-TransferFolder $env:CCT_PACKAGE; "
+            "$result = $json | ConvertFrom-Json; "
+            "if (-not $result.Verified) { throw 'Nested verification failed' }; "
+            "$result.Status"
+        )
+        process = subprocess.run([PWSH, "-NoProfile", "-Command", command],
+                                 env=environment, capture_output=True,
+                                 encoding="utf-8", errors="replace")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stdout.strip(), "verification-complete")
 
 
 if __name__ == "__main__":

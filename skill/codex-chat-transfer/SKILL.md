@@ -42,8 +42,9 @@ pwsh -NoProfile -File <skill>/scripts/codex_chat_transfer.ps1 -Action Export -Th
 6. When source and destination user profiles or workspace roots differ, pass an explicit `-PathMap 'OLD=NEW'` for every source root. Never guess mappings; verify each destination directory exists.
 7. Import the native sessions first. Use `-Reconcile` only as best effort; packaged Windows app-server access can fail even when the session import succeeds. Restart Codex once so it indexes the imported rollouts.
 8. If workspace metadata is present and the user wants full project fidelity, preview `RestoreWorkspace`, then use the detached restore helper. It closes Codex, backs up the database and global project state, restores titles/cwd/projects, verifies them, and relaunches Codex. Never write those files while Codex is running.
-9. Run `Verify` after relaunch. Do not call the migration complete until all chats are identical, mapped titles/cwd/project assignments verify, and requested memories are identical or explicitly quarantined.
-10. Report the import receipt, workspace-restore receipt, backup paths, and any unresolved limitation.
+9. Run `Verify` immediately after relaunch, before opening imported chats. Require identical native histories, verified titles/cwd/project assignments, and identical or explicitly quarantined requested memories. Save this baseline: opening a chat can append local events and change its later `cct diff` status to `ahead` without altering the imported history.
+10. Check the desktop app separately: find each imported chat in its intended project's chat list while unpinned, and read historical turns by the preserved thread ID. `Verify` cannot prove sidebar visibility. If a chat is readable but absent from the project list, follow the [visibility diagnosis](references/workspace-restoration.md#desktop-visibility-after-a-legacy-import) before reporting completion.
+11. Report the import receipt, workspace-restore receipt, baseline verification, desktop project visibility, backup paths, and any unresolved limitation.
 
 ```powershell
 pwsh -NoProfile -File <skill>/scripts/codex_chat_transfer.ps1 -Action Inspect -TransferFolder <folder>

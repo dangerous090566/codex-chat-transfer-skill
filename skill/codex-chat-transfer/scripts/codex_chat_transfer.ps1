@@ -31,6 +31,10 @@ $WorkspaceBridgePath = Join-Path $PSScriptRoot 'codex_workspace_bridge.py'
 $ExpectedCctSha256 = '94ECEC6D2A82184319500795BB600C3D57D212814E512C64480078CC2403BD20'
 $MaxSessionBytes = 512MB
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+# Native cct/Python output is UTF-8. A detached PowerShell process can inherit a
+# legacy Windows output code page, which corrupts JSON paths before ConvertFrom-Json.
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 
 function Get-FullPath {
     param([Parameter(Mandatory = $true)][string]$Path)

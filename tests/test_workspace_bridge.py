@@ -19,9 +19,9 @@ class WorkspaceTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="chat-transfer-test-", dir=os.environ.get("CCT_TEST_ROOT")))
         self.home = self.root / "codex"
         self.home.mkdir()
-        self.project = self.root / "source-project"
+        self.project = self.root / "源论文项目"
         self.project.mkdir()
-        self.dest = self.root / "destination-project"
+        self.dest = self.root / "目标论文项目"
         self.dest.mkdir()
         self.thread = "11111111-1111-4111-8111-111111111111"
 

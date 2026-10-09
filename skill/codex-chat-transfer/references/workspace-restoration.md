@@ -31,7 +31,8 @@ $args = '-NoProfile -File "' + $helper + '" -TransferFolder "<folder>" -PathMap 
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=('"' + $pwsh + '" ' + $args)}
 ```
 
-7. After relaunch, run `-Action Verify` with the identical mappings and check the JSON `Verified` field.
+7. After relaunch and before opening an imported chat, run `-Action Verify` with the identical mappings and check the JSON `Verified` field. Save this baseline result.
+8. In the desktop app, find the chat under the mapped local project while it is unpinned, then open it and read several historical turns by its original thread ID. A chat that is only reachable by direct navigation or pinning has not passed the project-list check.
 
 ## Safety and recovery
 
@@ -46,15 +47,28 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 - If an imported task is not indexed, restart Codex and retry. Do not insert a guessed row.
 - Original source project IDs are metadata references only; destination local project IDs can differ without changing behavior.
 
+## Desktop visibility after a legacy import
+
+The CLI's `Verify` checks the native rollout, local index fields, and mapped project roots. It cannot check the desktop sidebar. If the thread is readable by ID but missing from the unpinned project chat list, first allow the app to finish indexing and restart it once. Check the intended project rather than relying on a short Recent list page, which may omit older chats.
+
+If it is still absent, inspect the destination index **read-only** and compare the imported row with a visible user chat from the same project. Check `thread_source`, `model_provider`, `archived`, `cwd`, native `project_id`, and any legacy `thread-project-assignments`. Also inspect the imported rollout's `session_meta`. These fields are version dependent; a matching root and a verified project ID alone do not prove the app will list the chat. Do not infer that duplicate native and legacy project IDs are the cause.
+
+One Windows desktop migration exposed a legacy chat whose rollout had no `thread_source`; its index initially had `thread_source=NULL` and `model_provider=openai`, while visible user chats used `model_provider=custom`. Setting the index `thread_source` to `user` did not restore visibility. A later backed-up, one-row **index-only** provider change to the peer value made the chat appear in the project list. This is a diagnostic example, not a default value or a blanket migration step. A project-ID adjustment alone did not restore visibility in that case. Do not rewrite `session_meta` to force modern metadata: that changes the transferred history and fails the byte-equivalence check. The app may also rebuild index fields from the rollout after launch.
+
+If a compatibility repair is justified by destination peers, close Codex, take a fresh SQLite backup, and change only the affected thread's index row with an exact old-value guard. Keep the rollout untouched. Relaunch, confirm the chat appears unpinned in the correct project, read historical turns, and record the before/after values and backup path. If the app reverses the change or the evidence is ambiguous, stop and report the remaining limitation rather than applying broader database changes.
+
+Opening a restored chat may append local events. After that, `cct diff` can report `ahead` with zero conflicts. Use the saved, pre-open `identical` verification as the transfer-fidelity evidence, and describe later `ahead` state as local continuation; do not claim the current file is still byte-identical.
+
 ## Completion standard
 
 Completion requires evidence for each selected task:
 
-- native bundle is byte-equivalent locally;
+- native bundle was byte-equivalent at the saved pre-open verification;
 - display title matches the snapshot;
 - indexed `cwd` matches the mapped destination;
 - project assignment points to a local project with the mapped root;
 - requested memories are identical, newly added, or explicitly quarantined;
 - historical turns can be read by the preserved thread ID.
+- the unpinned chat appears in the intended desktop project list.
 
 Do not promise identical future responses. Models, tools, permissions, external files, and later global memories can still differ.

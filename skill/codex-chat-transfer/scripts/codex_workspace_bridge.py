@@ -442,7 +442,9 @@ def main() -> int:
             )
         else:
             result = verify(codex_home, workspace, args.path_map)
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    # ASCII JSON survives PowerShell hosts that decode redirected stdout with a
+    # legacy Windows code page. The saved workspace files remain UTF-8.
+    json.dump(result, sys.stdout, ensure_ascii=True, indent=2)
     sys.stdout.write("\n")
     return 0
 
@@ -451,6 +453,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        json.dump({"Status": "error", "Error": str(exc)}, sys.stderr, ensure_ascii=False)
+        json.dump({"Status": "error", "Error": str(exc)}, sys.stderr, ensure_ascii=True)
         sys.stderr.write("\n")
         raise SystemExit(1)
